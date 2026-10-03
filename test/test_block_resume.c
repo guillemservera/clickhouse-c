@@ -198,11 +198,96 @@ test_resume_retains(void)
     free(stream);
 }
 
+/* Allocator counting requests of exactly `size` bytes: a fixed column's data
+ * buffer. Growth of the ioless staging buffer goes through realloc, so it does
+ * not count. */
+typedef struct {
+    size_t size;
+    size_t hits;
+} size_count_alloc;
+
+static void *
+size_count_alloc_alloc(void *ud, size_t n)
+{
+    size_count_alloc *a = ud;
+    if (n == a->size) a->hits++;
+    return malloc(n ? n : 1);
+}
+
+static void *
+size_count_alloc_realloc(void *ud, void *p, size_t old_n, size_t new_n)
+{
+    return realloc(p, new_n ? new_n : 1);
+}
+
+static void
+size_count_alloc_free(void *ud, void *p, size_t n)
+{
+    free(p);
+}
+
+/* Short-buffer retries of a fixed column must not allocate & copy its body.
+ * Rewinding to the column checkpoint after a partial copy re-reads every byte
+ * buffered so far on each submit, quadratic in column size. */
+static void
+test_resume_fixed_no_reread(void)
+{
+    current_test = "resume_fixed_no_reread";
+    enum { ROWS = 3000, CHUNK = 64 };
+    size_count_alloc counter = { .size = ROWS * sizeof(uint64_t) };
+    chc_alloc al = { &counter, size_count_alloc_alloc,
+                     size_count_alloc_realloc, size_count_alloc_free };
+    chc_block_opts opts = {};
+    chc_block *partial = NULL;
+    size_t next_col = 0, fed = 0, retries = 0;
+    chc_err err = {};
+    chc_in in;
+    if (chc_in_init_ioless(&in, &al)) return;
+
+    test_mem_sink s;
+    chc_io io;
+    test_mem_sink_init(&s, &io);
+    int rc = chc__write_varuint(&io, 1, &err);
+    if (!rc) rc = chc__write_varuint(&io, ROWS, &err);
+    if (!rc) rc = chc__write_string(&io, "n", 1, &err);
+    if (!rc) rc = chc__write_string(&io, "UInt64", 6, &err);
+    for (uint64_t r = 0; !rc && r < ROWS; r++)
+        rc = chc__write_bytes(&io, &r, sizeof r, &err);
+    CHECK_OK(rc, err);
+
+    while ((rc = chc__block_resume_in(&in, &al, &opts, &partial, &next_col,
+                                      &err)) == CHC_WOULD_BLOCK) {
+        CHECK(fed < s.len);
+        if (fed >= s.len) goto out;
+        size_t take = s.len - fed < CHUNK ? s.len - fed : CHUNK;
+        rc = chc_in_submit(&in, s.data + fed, take, &err);
+        CHECK_OK(rc, err);
+        fed += take;
+        retries++;
+    }
+    CHECK_OK(rc, err);
+    CHECK(retries > ROWS * sizeof(uint64_t) / CHUNK);  /* body fed in pieces */
+    CHECK_EQ_U64(counter.hits, 1);                     /* allocated once */
+    CHECK(partial != NULL);
+    if (partial) {
+        size_t es = 0;
+        const uint64_t *v = chc_column_fixed_data(chc_block_column(partial, 0), &es);
+        CHECK_EQ_U64(es, sizeof *v);
+        CHECK_EQ_U64(v[0], 0);
+        CHECK_EQ_U64(v[ROWS - 1], ROWS - 1);
+    }
+out:
+    chc_block_destroy(partial, &al);
+    chc_in_free(&in);
+    test_mem_sink_free(&s);
+}
+
 int
 main(void)
 {
     test_resume_golden();
     test_resume_retains();
+    test_resume_fixed_no_reread();
 
     if (fail_count) {
         fprintf(stderr, "%d check(s) failed\n", fail_count);

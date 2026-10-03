@@ -2069,6 +2069,13 @@ chc__col_read_fixed(chc_in *in, size_t elem_size, size_t n_rows,
             chc__column_destroy(c, al);
             return chc__err_set(err, CHC_ERR_PROTOCOL, "column size overflow");
         }
+        /* Ioless short buffer rewinds this column & re-parses it after next
+         * submit. Bail before alloc + copy so each retry costs O(1), not
+         * O(bytes buffered so far), keeping a column fed in n chunks linear */
+        if (CHC__IOLESS(in) && chc_in_available(in) < nbytes) {
+            chc__column_destroy(c, al);
+            return chc__err_set(err, CHC_WOULD_BLOCK, "ioless buffer drained");
+        }
         c->fixed.data = chc__alloc(al, nbytes, err);
         if (!c->fixed.data) { chc__column_destroy(c, al); return CHC_ERR_OOM; }
         int rc = chc__read_bytes(in, c->fixed.data, nbytes, err);
