@@ -161,7 +161,7 @@ oracle_decode(const uint8_t *bytes, size_t len, const chc_codec *codec,
     for (;;) {
         chc_packet pkt = {};
         int rc = chc_client_recv_packet(&c, &pkt, err);
-        if (rc != CHC_OK) { chc_packet_clear(&c, &pkt); chc_in_free(&c.in); return -1; }
+        if (rc != CHC_OK) { chc_packet_clear(&c, &pkt); chc__client_recv_state_free(&c); chc_in_free(&c.in); return -1; }
         rec_take(&out[n], &pkt);
         pkt.block = NULL;                /* moved into record */
         chc_packet_clear(&c, &pkt);
@@ -171,7 +171,7 @@ oracle_decode(const uint8_t *bytes, size_t len, const chc_codec *codec,
     }
     *out_n = n;
     *consumed = c.in.consumed;
-    chc_in_free(&c.in);
+    chc__client_recv_state_free(&c); chc_in_free(&c.in);
     return 0;
 }
 

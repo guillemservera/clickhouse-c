@@ -517,7 +517,7 @@ chc__decomp_src_init(chc__decomp_src *s, chc_in *raw, const chc_codec *codec,
     *out_io = (chc_io) { .ud = s, .read = chc__decomp_io_read };
 }
 
-static void
+CHC_MAYBE_UNUSED static void
 chc__decomp_src_free(chc__decomp_src *s)
 {
     s->al->free(s->al->ud, s->frame_buf, s->frame_cap);

@@ -102,17 +102,17 @@ decode_subject(const uint8_t *bytes, size_t len, size_t chunk,
             chc_packet_clear(&c, &pkt);
             if (fed >= len) {
                 chc__err_set(err, CHC_ERR_EOF, "feed underrun");
-                chc_in_free(&c.in); return -1;
+                chc__client_recv_state_free(&c); chc_in_free(&c.in); return -1;
             }
             size_t take = (len - fed) < chunk ? (len - fed) : chunk;
             if (chc_in_submit(&c.in, bytes + fed, take, &e)) {
-                *err = e; chc_in_free(&c.in); return -1;
+                *err = e; chc__client_recv_state_free(&c); chc_in_free(&c.in); return -1;
             }
             fed += take;
             continue;
         }
         if (rc != CHC_OK) {
-            *err = e; chc_packet_clear(&c, &pkt); chc_in_free(&c.in); return -1;
+            *err = e; chc_packet_clear(&c, &pkt); chc__client_recv_state_free(&c); chc_in_free(&c.in); return -1;
         }
         chc_packet_kind k = pkt.kind;
         if (k == CHC_PKT_DATA && n < N_DATA) { out[n++] = pkt.block; pkt.block = NULL; }
@@ -120,7 +120,7 @@ decode_subject(const uint8_t *bytes, size_t len, size_t chunk,
         if (k == CHC_PKT_END_OF_STREAM) break;
     }
     *out_n = n;
-    chc_in_free(&c.in);
+    chc__client_recv_state_free(&c); chc_in_free(&c.in);
     return 0;
 }
 
@@ -165,14 +165,14 @@ decode_subject(const uint8_t *bytes, size_t len, size_t chunk,
     for (;;) {
         chc_packet pkt = {};
         int rc = chc_client_recv_packet(&c, &pkt, err);
-        if (rc != CHC_OK) { chc_packet_clear(&c, &pkt); chc_in_free(&c.in); return -1; }
+        if (rc != CHC_OK) { chc_packet_clear(&c, &pkt); chc__client_recv_state_free(&c); chc_in_free(&c.in); return -1; }
         chc_packet_kind k = pkt.kind;
         if (k == CHC_PKT_DATA && n < N_DATA) { out[n++] = pkt.block; pkt.block = NULL; }
         chc_packet_clear(&c, &pkt);
         if (k == CHC_PKT_END_OF_STREAM) break;
     }
     *out_n = n;
-    chc_in_free(&c.in);
+    chc__client_recv_state_free(&c); chc_in_free(&c.in);
     return 0;
 }
 
@@ -246,6 +246,62 @@ test_compressed_recv(void)
 
     free(stream);
     test_free_blocks(ref, N_DATA, &al);
+}
+
+/* Counts frame scratch growing to a full LZ4 frame: realloc to exactly
+ * CHC_COMPRESS_MAX_CHUNK. Column and staging buffers never land on it. */
+static size_t g_full_frame_grows;
+
+static void *
+frame_count_alloc(void *ud, size_t n)
+{
+    return malloc(n ? n : 1);
+}
+
+static void *
+frame_count_realloc(void *ud, void *p, size_t old_n, size_t new_n)
+{
+    if (new_n == CHC_COMPRESS_MAX_CHUNK && old_n < new_n) g_full_frame_grows++;
+    return realloc(p, new_n ? new_n : 1);
+}
+
+static void
+frame_count_free(void *ud, void *p, size_t n)
+{
+    free(p);
+}
+
+/* Two BIG_ROWS Data packets, both carrying full 64 KiB frames. Frame scratch
+ * must survive the first block & serve the second, not be freed & regrown. */
+static void
+test_frame_scratch_reused(void)
+{
+    current_test = "frame_scratch_reused[" MODE_NAME "]";
+    chc_alloc al = { NULL, frame_count_alloc, frame_count_realloc, frame_count_free };
+    chc_block_opts opts = { .has_block_info = true, .has_custom_serialization = true };
+    chc_codec codec;
+    chc_lz4_codec_init(&codec);
+    chc_block *subj[N_DATA] = {};
+    size_t sn = 0;
+    chc_err e = {};
+
+    test_mem_sink s;
+    chc_io io;
+    test_mem_sink_init(&s, &io);
+    int rc = test_write_compressed_packet(&io, &al, &opts, &codec, BIG_ROWS, &e);
+    if (!rc) rc = test_write_compressed_packet(&io, &al, &opts, &codec, BIG_ROWS, &e);
+    if (!rc) rc = chc__write_varuint(&io, CHC_PKT_END_OF_STREAM, &e);
+    CHECK_OK(rc, e);
+
+    g_full_frame_grows = 0;
+    size_t chunk = g_chunks[sizeof g_chunks / sizeof *g_chunks - 1];
+    rc = decode_subject(s.data, s.len, chunk, &codec, &al, subj, &sn, &e);
+    CHECK_OK(rc, e);
+    CHECK_EQ_U64(sn, N_DATA);
+    CHECK_EQ_U64(g_full_frame_grows, 1);
+out:
+    test_free_blocks(subj, sn, &al);
+    test_mem_sink_free(&s);
 }
 
 /* Hostile frame: LZ4 original size above INT_MAX must be rejected at the
@@ -323,6 +379,7 @@ int
 main(void)
 {
     test_compressed_recv();
+    test_frame_scratch_reused();
     test_lz4_orig_over_int_max();
 
     if (fail_count) {

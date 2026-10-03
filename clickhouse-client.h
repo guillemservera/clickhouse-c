@@ -246,31 +246,50 @@ struct chc_client {
     /* Compressed-block frame-granularity resume; lifecycle = one compressed block.
      * recv_dec_in accumulates decompressed bytes the column reader has not yet consumed;
      * recv_decomp decompresses one frame at a time from `in`.
-     * recv_partial / recv_next_col carry per-column progress over recv_dec_in. */
+     * recv_partial / recv_next_col carry per-column progress over recv_dec_in.
+     * recv_decomp's frame scratch outlives the block: both recv paths reuse it
+     * for the next compressed block, chc__client_recv_state_free releases it. */
     bool             recv_dec_active;
     chc__decomp_src  recv_decomp;
     chc_in           recv_dec_in;
 };
 
-/* Free the persisted compressed-resume decompressor + decompressed buffer.
- * Idempotent; no-op when no compressed block is in flight. */
+/* Free the persisted compressed-resume decompressed buffer, keeping frame
+ * scratch. Idempotent; no-op when no compressed block is in flight. */
 static void
 chc__client_recv_comp_free(chc_client *c)
 {
     if (!c->recv_dec_active) return;
-    chc__decomp_src_free(&c->recv_decomp);
     chc_in_free(&c->recv_dec_in);
     c->recv_dec_active = false;
 }
 
-/* Free retained recv-resume state. Safe at any packet boundary or teardown. */
+/* Free retained recv-resume state & frame scratch. Safe at any packet
+ * boundary or teardown. */
 static void
 chc__client_recv_state_free(chc_client *c)
 {
     if (c->recv_partial) { chc_block_destroy(c->recv_partial, c->al); c->recv_partial = NULL; }
     chc__client_recv_comp_free(c);
+    c->al->free(c->al->ud, c->recv_decomp.frame_buf, c->recv_decomp.frame_cap);
+    c->al->free(c->al->ud, c->recv_decomp.comp_buf,  c->recv_decomp.comp_cap);
+    c->recv_decomp = (chc__decomp_src) {0};
     c->recv_in_block = 0;
     c->recv_next_col = 0;
+}
+
+/* Point recv_decomp at `in` for a new compressed block. Frame scratch from
+ * earlier blocks carries over, so steady-state recv allocates no frame
+ * buffers: per-block alloc + free of ~1 MiB frames churns pages in & out. */
+static void
+chc__client_decomp_bind(chc_client *c, chc_io *out_io)
+{
+    chc__decomp_src keep = c->recv_decomp;
+    chc__decomp_src_init(&c->recv_decomp, &c->in, c->codec, c->al, out_io);
+    c->recv_decomp.frame_buf = keep.frame_buf;
+    c->recv_decomp.frame_cap = keep.frame_cap;
+    c->recv_decomp.comp_buf  = keep.comp_buf;
+    c->recv_decomp.comp_cap  = keep.comp_cap;
 }
 
 void
@@ -701,15 +720,13 @@ chc__recv_block_compressed(chc_client *c, const chc_block_opts *opts,
                             "compression enabled but codec is NULL");
     bool ioless = c->in.io == NULL;
     if (ioless) chc__in_checkpoint(&c->in);   /* raw in, at compressed block start */
-    chc__decomp_src src;
     chc_io decomp_io;
-    chc__decomp_src_init(&src, &c->in, c->codec, c->al, &decomp_io);
+    chc__client_decomp_bind(c, &decomp_io);
     chc_in dec_in;
     int rc = chc_in_init(&dec_in, &decomp_io, c->al, 0, err);
-    if (rc != CHC_OK) { chc__decomp_src_free(&src); return rc; }
+    if (rc != CHC_OK) return rc;
     rc = chc_block_read(&dec_in, c->al, opts, out, err);
     chc_in_free(&dec_in);
-    chc__decomp_src_free(&src);
     if (ioless && rc == CHC_WOULD_BLOCK) chc__in_rewind(&c->in);
     return rc;
 }
@@ -744,7 +761,7 @@ chc__recv_block_compressed_resume(chc_client *c, const chc_block_opts *opts,
         int rc = chc_in_init_ioless(&c->recv_dec_in, c->al);
         if (rc != CHC_OK) return rc;
         chc_io scratch_io;  /* push mode: the decomp io adapter goes unused */
-        chc__decomp_src_init(&c->recv_decomp, &c->in, c->codec, c->al, &scratch_io);
+        chc__client_decomp_bind(c, &scratch_io);
         c->recv_dec_active = true;
     }
 
